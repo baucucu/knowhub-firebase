@@ -8,20 +8,18 @@ from typing import Any
 initialize_app()
 
 
-@https_fn.on_request()
-def on_request_example(req: https_fn.Request) -> https_fn.Response:
-    return https_fn.Response("Hello world!")
-
-
 def build_tree(urls):
     items = []
+
     domain_counts = {}
     domain_urls = {}
+
     for url in urls:
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
         domain_counts[domain] = domain_counts.get(domain, 0) + 1
         domain_urls.setdefault(domain, []).append(url)
+
     for domain, count in domain_counts.items():
         item = {
             "text": domain,
@@ -30,7 +28,8 @@ def build_tree(urls):
             "urls": domain_urls.get(domain, [])
         }
         items.append(item)
-        return items
+
+    return items
 
 
 @https_fn.on_call()
@@ -43,9 +42,10 @@ def parse_sitemap(req: https_fn.CallableRequest) -> Any:
 
 
 @https_fn.on_request()
-def parse_url(req: https_fn.CallableRequest) -> Any:
-    url = req.data['url']
+def parse_url(req: https_fn.Request) -> https_fn.Response:
+    payload = json.loads(req.data)
+    url = payload['url']
     tree = sitemap_tree_for_homepage(url)
     urls = [page.url for page in tree.all_pages()]
     tree_json = json.dumps(build_tree(urls))
-    return tree_json
+    return https_fn.Response(tree_json)
