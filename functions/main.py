@@ -1,15 +1,60 @@
-from firebase_functions import https_fn
+from firebase_functions import (https_fn, options, storage_fn)
+from firebase_functions.options import MemoryOption
 from firebase_admin import initialize_app
-import json
-from urllib.parse import urlparse
 from usp.tree import sitemap_tree_for_homepage
+from zep_python import (ZepClient)
+from llama_index import download_loader
+from llama_index.node_parser.extractors import (
+    MetadataExtractor,
+    SummaryExtractor,
+    QuestionsAnsweredExtractor,
+    TitleExtractor,
+    KeywordExtractor,
+    # MetadataFeatureExtractor,
+)
+from llama_index.node_parser import SimpleNodeParser
+from llama_index import ServiceContext, OpenAIEmbedding
+from llama_index.llms import OpenAI
+from llama_index.vector_stores import WeaviateVectorStore
+from llama_index import VectorStoreIndex
+from llama_index import set_global_service_context
+from urllib.parse import urlparse
 from typing import Any
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import DeepLake
+import weaviate
 import openai
-import deeplake
+# import langchain
+import json
+import os
+from urllib.parse import urlparse, unquote, quote
+import mysql.connector
 
 initialize_app()
+
+# constants and global variables
+db_config = {
+    "host": "82.77.44.36",
+    "port": "3306",
+    "user": "administrator",
+    "password": "P@rola-01",
+    "database": "knowhub_database"
+}
+key = "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"
+os.environ["OPENAI_API_KEY"] = key
+openai.api_key = key
+embed_model = OpenAIEmbedding()
+llm = OpenAI(model='gpt-3.5-turbo-16k', temperature=0)
+service_context = ServiceContext.from_defaults(
+  llm=llm,
+  embed_model=embed_model,
+)
+set_global_service_context(service_context)
+try:
+    zep = ZepClient("http://82.77.44.34:8000")
+    weaviate_client = weaviate.Client(
+        url="http://82.77.44.44:8081",
+    )
+except Exception as e:
+    print(e)
 
 
 def build_tree(urls):
@@ -36,18 +81,20 @@ def build_tree(urls):
     return items
 
 
-@https_fn.on_call()
-def parse_sitemap(req: https_fn.CallableRequest) -> Any:
-    url = req.data['url']
-    tree = sitemap_tree_for_homepage(url)
-    urls = [page.url for page in tree.all_pages()]
-    tree_json = json.dumps(build_tree(urls))
-    return tree_json
-
-
-@https_fn.on_request()
+@https_fn.on_request(
+    region="europe-west3",
+    cors=options.CorsOptions(
+        cors_origins="*",
+        cors_methods=["post"],
+    ),
+    memory=MemoryOption.GB_1,
+    timeout_sec=540,
+)
 def parse_url(req: https_fn.Request) -> https_fn.Response:
     payload = json.loads(req.data)
+    # check if payload contains url
+    if 'url' not in payload:
+        return https_fn.Response({"status": 'error', "message": "url is not provided!"})
     url = payload['url']
     tree = sitemap_tree_for_homepage(url)
     urls = [page.url for page in tree.all_pages()]
@@ -55,19 +102,205 @@ def parse_url(req: https_fn.Request) -> https_fn.Response:
     return https_fn.Response(tree_json)
 
 
-@https_fn.on_call()
-def create_dataset(req: https_fn.CallableRequest) -> Any:
-    client_id = req.data['client_id']
-    topic = req.data['topic']
-    account_id = "headlightsolutionsapp"
-    embeddings = OpenAIEmbeddings()
+def get_clean_filename(url):
+    parsed_url = urlparse(url)
+    clean_filename = os.path.basename(parsed_url.path)
+    return unquote(clean_filename)
 
+
+def extract(text):
+    print("text: ", text)
+    text = text.split("/")
+    client = text[0]
+    hub = text[1]
+    file_name = text[2]
+    return {"client": client, "hub": hub, "file_name": file_name}
+
+
+def process_file(url, file_name):
+    RemoteReader = download_loader("RemoteReader")
+    loader = RemoteReader()
+    print("Loading documents...")
+    documents = loader.load_data(url=url)
+    print(f"Loaded {len(documents)} docs")
+
+    for index, doc in enumerate(documents):
+        metadata = doc.metadata
+        metadata['file_name'] = file_name
+        documents[index].metadata = metadata
+    print(documents[0])
+
+    node_parser = SimpleNodeParser.from_defaults(
+        include_metadata=True,
+        include_prev_next_rel=True,
+    )
+    print("Extracting nodes...")
+    nodes = node_parser.get_nodes_from_documents(documents, show_progress=True)
+    print(f"Extracted {len(nodes)} nodes")
+    print(nodes[0])
+
+    docs = []
+    for node in nodes:
+        docs.append({
+            "node_id": node.id_,
+            "file_name": node.metadata["file_name"],
+            "page_label": node.metadata["page_label"],
+            "source": node.metadata["Source"],
+            "text": node.text,
+            "hash": node.hash
+        })
+    return docs
+
+
+def update_sql(customer_id, cloud_storage_id, theme_id, resource_status):
+    # Connecting to the MySQL database
     try:
-        db = DeepLake(
-            dataset_path=f"hub://{account_id}/{client_id}/{topic}",
-            embedding_function=embeddings,
+        connection = mysql.connector.connect(**db_config)
+        cursor = connection.cursor()
+
+        # Construct the SQL query
+        update_query = (
+            "UPDATE KnoledgeBaseResource "
+            "SET ResourceStatus = %s "
+            "WHERE CustomerId = %s AND CloudStorageId = %s AND ThemeId = %s"
         )
-        return ({"status": "200", "db": db })
-    except:
-        print("An exception occurred")
-        return({"status":"400"})
+
+        # Execute the update query
+        cursor.execute(update_query, (resource_status, customer_id, cloud_storage_id, theme_id))
+        connection.commit()
+
+        print("Update successful")
+
+    except mysql.connector.Error as err:
+        print("Error:", err)
+
+    finally:
+        # Close the connection and cursor
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+def process_resource(url, file_name, client_name, hub_name, cloud_storage_id):
+    customer_id = client_name
+    theme_id = hub_name.split("_")[1]
+    try:
+        docs = process_file(url, file_name, client_name, hub_name)
+    except Exception as e:
+        print(e)
+        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=2)
+        return
+    try:
+        with weaviate_client.batch() as batch:
+            for data_obj in docs:
+                batch.add_data_object(
+                    data_obj,
+                    class_name=hub_name,
+                    # tenant=client_name,
+                )
+    except Exception as e:
+        print(e)
+        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=2)
+        return
+    update_sql(customer_id, cloud_storage_id, theme_id, resource_status=1)
+    return
+
+
+@storage_fn.on_object_finalized(
+    region="europe-west3",
+    memory=MemoryOption.GB_1,
+    timeout_sec=540,
+)
+def process_document(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
+    """When a document is uploaded in the Storage bucket,
+    process its content using the process_file function."""
+
+    print("data: ", event.data)
+    # get google storage file signed  url
+
+    name = event.data.name
+    url = f"https://firebasestorage.googleapis.com/v0/b/knowhubai.appspot.com/o/{quote(name,safe='')}?alt=media"
+    data = extract(name)
+    file_name = data['file_name']
+    client_name = data['client']
+    hub_name = data['hub']
+    print("client_name: ", client_name)
+    print("hub_name: ", hub_name)
+    customer_id = client_name
+    cloud_storage_id = event.data.generation
+    theme_id = hub_name.split("_")[1]
+    print("theme_id: ", theme_id)
+    process_resource(url, file_name, client_name, hub_name, customer_id, cloud_storage_id, theme_id)
+
+
+@https_fn.on_request(
+    region="europe-west3",
+    cors=options.CorsOptions(
+        cors_origins="*",
+        cors_methods=["post"],
+    ),
+    memory=MemoryOption.GB_1,
+    timeout_sec=540,
+)
+def process_webpage(req: https_fn.Request) -> https_fn.Response:
+    payload = json.loads(req.data)
+    # check if payload contains url
+    if 'url' not in payload:
+        return https_fn.Response({"status": 'error', "message": "url is not provided!"})
+    url = payload['url']
+    file_name = get_clean_filename(url)
+    print("file_name: ", file_name)
+    client_name = payload['client']
+    hub_name = payload['hub']
+    theme_id = hub_name.split("_")[1]
+    cloud_storage_id = payload['cloud_storage_id']
+    print("theme_id: ", theme_id)
+    try:
+        process_resource(url, file_name,  client_name, hub_name, cloud_storage_id)
+        return https_fn.Response({"status": 'success', "message": "processing started!"})
+    except Exception as e:
+        print(e)
+        return https_fn.Response({"status": 'error', "message": "error!"})
+
+
+@https_fn.on_request(
+    region="europe-west3",
+    cors=options.CorsOptions(
+        cors_origins="*",
+        cors_methods=["post"],
+    ),
+    memory=MemoryOption.GB_1,
+    timeout_sec=540,
+)
+def chat(req: https_fn.Request) -> https_fn.Response:
+    payload = json.loads(req.data)
+    try:
+        hub_name = payload['hub_name']
+        message = payload['message']
+    except Exception as e:
+        print(e)
+        return https_fn.Response({"status": 'error', "message": "error!"})
+    print("hub_name: ", hub_name)
+    print("message: ", message)
+
+    vector_store = WeaviateVectorStore(
+        weaviate_client=weaviate_client,
+        index_name=hub_name
+    )
+
+    index = VectorStoreIndex.from_vector_store(vector_store)
+
+    query_engine = index.as_query_engine(
+        similarity_top_k=5,
+        vector_store_query_mode="hybrid",
+    )
+    print("Generating response...")
+    try:
+        res = query_engine.query(message)
+        answer = json.dumps(res.response, indent=2)
+        print("response: ", answer)
+        return https_fn.Response(answer)
+    except Exception as e:
+        print(e)
+        return https_fn.Response({"status": 'error', "message": str(e)})

@@ -1,5 +1,10 @@
 firebase_functions~=0.1.0
+firebase_admin
 ultimate-sitemap-parser
-langchain
+weaviate-client
+zep-python
+pandadoc
 openai
-deeplake
+langchain
+llama-index
+mysql-connector-python
