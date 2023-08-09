@@ -3,8 +3,7 @@ firebase_admin
 ultimate-sitemap-parser
 weaviate-client
 zep-python
-pandadoc
 openai
-langchain
 llama-index
 mysql-connector-python
+html2text

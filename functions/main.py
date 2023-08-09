@@ -4,14 +4,15 @@ from firebase_admin import initialize_app
 from usp.tree import sitemap_tree_for_homepage
 from zep_python import (ZepClient)
 from llama_index import download_loader
-from llama_index.node_parser.extractors import (
-    MetadataExtractor,
-    SummaryExtractor,
-    QuestionsAnsweredExtractor,
-    TitleExtractor,
-    KeywordExtractor,
-    # MetadataFeatureExtractor,
-)
+from llama_index import SimpleWebPageReader
+# from llama_index.node_parser.extractors import (
+#     MetadataExtractor,
+#     SummaryExtractor,
+#     QuestionsAnsweredExtractor,
+#     TitleExtractor,
+#     KeywordExtractor,
+#     # MetadataFeatureExtractor,
+# )
 from llama_index.node_parser import SimpleNodeParser
 from llama_index import ServiceContext, OpenAIEmbedding
 from llama_index.llms import OpenAI
@@ -19,10 +20,8 @@ from llama_index.vector_stores import WeaviateVectorStore
 from llama_index import VectorStoreIndex
 from llama_index import set_global_service_context
 from urllib.parse import urlparse
-from typing import Any
 import weaviate
 import openai
-# import langchain
 import json
 import os
 from urllib.parse import urlparse, unquote, quote
@@ -38,7 +37,7 @@ db_config = {
     "password": "P@rola-01",
     "database": "knowhub_database"
 }
-key = "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"
+key = "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"
 os.environ["OPENAI_API_KEY"] = key
 openai.api_key = key
 embed_model = OpenAIEmbedding()
@@ -117,15 +116,22 @@ def extract(text):
     return {"client": client, "hub": hub, "file_name": file_name}
 
 
-def process_file(url, file_name):
-    RemoteReader = download_loader("RemoteReader")
-    loader = RemoteReader()
+def process_file(url, file_name, type):
     print("Loading documents...")
-    documents = loader.load_data(url=url)
+    if type == "web_page":
+        documents = SimpleWebPageReader(html_to_text=True).load_data(
+            [url]
+        )
+    else:
+        RemoteReader = download_loader("RemoteReader")
+        loader = RemoteReader()
+        documents = loader.load_data(url=url)
     print(f"Loaded {len(documents)} docs")
 
     for index, doc in enumerate(documents):
         metadata = doc.metadata
+        if (type == "web_page"):
+            file_name = get_clean_filename(url)
         metadata['file_name'] = file_name
         documents[index].metadata = metadata
     print(documents[0])
@@ -138,33 +144,51 @@ def process_file(url, file_name):
     nodes = node_parser.get_nodes_from_documents(documents, show_progress=True)
     print(f"Extracted {len(nodes)} nodes")
     print(nodes[0])
-
     docs = []
-    for node in nodes:
-        docs.append({
-            "node_id": node.id_,
-            "file_name": node.metadata["file_name"],
-            "page_label": node.metadata["page_label"],
-            "source": node.metadata["Source"],
-            "text": node.text,
-            "hash": node.hash
-        })
+    if type == "document":
+        for node in nodes:
+            docs.append({
+                "node_id": node.id_,
+                "file_name": node.metadata["file_name"],
+                "page_label": node.metadata["page_label"],
+                "source": node.metadata["Source"],
+                "text": node.text,
+                "hash": node.hash
+            })
+    else:
+        for node in nodes:
+            docs.append({
+                "node_id": node.id_,
+                "file_name": file_name,
+                "source": url,
+                "text": node.text,
+                "hash": node.hash
+            })
     return docs
 
 
-def update_sql(customer_id, cloud_storage_id, theme_id, resource_status):
+def update_sql(customer_id, cloud_storage_id, theme_id, resource_status, type):
+    theme_id = int(theme_id)
+    customer_id = int(customer_id)
+    cloud_storage_id = str(cloud_storage_id)
     # Connecting to the MySQL database
     try:
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor()
-
-        # Construct the SQL query
-        update_query = (
-            "UPDATE KnoledgeBaseResource "
-            "SET ResourceStatus = %s "
-            "WHERE CustomerId = %s AND CloudStorageId = %s AND ThemeId = %s"
-        )
-
+        if type == "web_page":
+            # Construct the SQL query
+            update_query = (
+                "UPDATE KnoledgeBaseResourceDetail "
+                "SET ResourceStatus = %s "
+                "WHERE CustomerId = %s AND CloudStorageId = %s AND ThemeId = %s"
+            )
+        else:
+            # Construct the SQL query
+            update_query = (
+                "UPDATE KnoledgeBaseResource "
+                "SET ResourceStatus = %s "
+                "WHERE CustomerId = %s AND CloudStorageId = %s AND ThemeId = %s"
+            )
         # Execute the update query
         cursor.execute(update_query, (resource_status, customer_id, cloud_storage_id, theme_id))
         connection.commit()
@@ -182,14 +206,15 @@ def update_sql(customer_id, cloud_storage_id, theme_id, resource_status):
             connection.close()
 
 
-def process_resource(url, file_name, client_name, hub_name, cloud_storage_id):
-    customer_id = client_name
-    theme_id = hub_name.split("_")[1]
+def process_resource(url, file_name, client_name, hub_name, cloud_storage_id, type):
+    customer_id = int(client_name)
+    theme_id = int(hub_name.split("_")[1])
+    cloud_storage_id = str(cloud_storage_id)
     try:
-        docs = process_file(url, file_name, client_name, hub_name)
+        docs = process_file(url, file_name, type)
     except Exception as e:
-        print(e)
-        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=2)
+        print("Error extracting documents from file: ", e)
+        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=2, type=type)
         return
     try:
         with weaviate_client.batch() as batch:
@@ -197,14 +222,15 @@ def process_resource(url, file_name, client_name, hub_name, cloud_storage_id):
                 batch.add_data_object(
                     data_obj,
                     class_name=hub_name,
-                    # tenant=client_name,
                 )
+        print("Data objects added to Weaviate")
+        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=1, type=type)
+        return True
     except Exception as e:
+        print("Error adding data objects to Weaviate")
         print(e)
-        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=2)
-        return
-    update_sql(customer_id, cloud_storage_id, theme_id, resource_status=1)
-    return
+        update_sql(customer_id, cloud_storage_id, theme_id, resource_status=2, type=type)
+        return False
 
 
 @storage_fn.on_object_finalized(
@@ -225,13 +251,20 @@ def process_document(event: storage_fn.CloudEvent[storage_fn.StorageObjectData])
     file_name = data['file_name']
     client_name = data['client']
     hub_name = data['hub']
+    cloud_storage_id = event.data.generation
+    type = "document"
     print("client_name: ", client_name)
     print("hub_name: ", hub_name)
-    customer_id = client_name
-    cloud_storage_id = event.data.generation
-    theme_id = hub_name.split("_")[1]
-    print("theme_id: ", theme_id)
-    process_resource(url, file_name, client_name, hub_name, customer_id, cloud_storage_id, theme_id)
+    print("cloud_storage_id: ", cloud_storage_id)
+    print("file_name: ", file_name)
+    print("url: ", url)
+    result = process_resource(url, file_name, client_name, hub_name, cloud_storage_id,  type)
+    if result:
+        print("success")
+        return {"status": "success"}
+    else:
+        print("error")
+        return {"status": "error"}
 
 
 @https_fn.on_request(
@@ -247,21 +280,24 @@ def process_webpage(req: https_fn.Request) -> https_fn.Response:
     payload = json.loads(req.data)
     # check if payload contains url
     if 'url' not in payload:
-        return https_fn.Response({"status": 'error', "message": "url is not provided!"})
+        return https_fn.Response(status=500, response="url is not provided!")
     url = payload['url']
-    file_name = get_clean_filename(url)
-    print("file_name: ", file_name)
+    file_name = url
     client_name = payload['client']
     hub_name = payload['hub']
-    theme_id = hub_name.split("_")[1]
     cloud_storage_id = payload['cloud_storage_id']
-    print("theme_id: ", theme_id)
-    try:
-        process_resource(url, file_name,  client_name, hub_name, cloud_storage_id)
-        return https_fn.Response({"status": 'success', "message": "processing started!"})
-    except Exception as e:
-        print(e)
-        return https_fn.Response({"status": 'error', "message": "error!"})
+    type = "web_page"
+    print("file_name: ", file_name)
+    print("client_name: ", client_name)
+    print("hub_name: ", hub_name)
+    print("cloud_storage_id: ", cloud_storage_id)
+    result = process_resource(url, file_name, client_name, hub_name, cloud_storage_id,  type)
+    if result:
+        print("success")
+        return https_fn.Response(status=200, response="success")
+    else:
+        print("error")
+        return https_fn.Response(status=500, response="error")
 
 
 @https_fn.on_request(
@@ -280,7 +316,7 @@ def chat(req: https_fn.Request) -> https_fn.Response:
         message = payload['message']
     except Exception as e:
         print(e)
-        return https_fn.Response({"status": 'error', "message": "error!"})
+        return https_fn.Response(status=500, response=str(e))
     print("hub_name: ", hub_name)
     print("message: ", message)
 
@@ -303,4 +339,4 @@ def chat(req: https_fn.Request) -> https_fn.Response:
         return https_fn.Response(answer)
     except Exception as e:
         print(e)
-        return https_fn.Response({"status": 'error', "message": str(e)})
+        return https_fn.Response(status=500, response=str(e))
