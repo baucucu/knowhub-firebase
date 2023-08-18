@@ -24,33 +24,33 @@ import weaviate
 import openai
 import json
 import os
-from urllib.parse import urlparse, unquote, quote
+from urllib.parse import urlparse, unquote, quote, urljoin
 import mysql.connector
+import requests
+from bs4 import BeautifulSoup
 
 initialize_app()
 
 # constants and global variables
 db_config = {
-    "host": "82.77.44.36",
-    "port": "3306",
-    "user": "administrator",
-    "password": "P@rola-01",
-    "database": "knowhub_database"
+    "host": os.environ.get("SQL_HOST"),
+    "port": os.environ.get("SQL_PORT"),
+    "user": os.environ.get("SQL_USER"),
+    "password": os.environ.get("SQL_PASS"),
+    "database": os.environ.get("SQL_DB"),
 }
-key = "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"
-os.environ["OPENAI_API_KEY"] = key
-openai.api_key = key
+openai.api_key = os.environ.get("OPENAI_API_KEY")
 embed_model = OpenAIEmbedding()
-llm = OpenAI(model='gpt-3.5-turbo-16k', temperature=0)
+llm = OpenAI(model=os.environ.get("AI_MODEL"), temperature=0)
 service_context = ServiceContext.from_defaults(
   llm=llm,
   embed_model=embed_model,
 )
 set_global_service_context(service_context)
 try:
-    zep = ZepClient("http://82.77.44.34:8000")
+    zep = ZepClient(os.environ.get("ZEP_API_URL"))
     weaviate_client = weaviate.Client(
-        url="http://82.77.44.44:8081",
+        url=os.environ.get("WEAVIATE_URL"),
     )
 except Exception as e:
     print(e)
@@ -80,6 +80,34 @@ def build_tree(urls):
     return items
 
 
+def recursive_crawler(url, depth, max_pages):
+    parsed_url = urlparse(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    visited_urls = set()
+    results = []
+
+    def crawl(url, current_depth):
+        if current_depth > depth or len(results) >= max_pages or url in visited_urls:
+            return
+        try:
+            response = requests.get(url)
+            visited_urls.add(url)
+            if response.status_code == 200:
+                results.append(url)
+                soup = BeautifulSoup(response.text, "html.parser")
+                for link in soup.find_all("a", href=True):
+                    new_url = link["href"]
+                    full_url = urljoin(base_url, new_url)
+                    parsed_new_url = urlparse(full_url)
+                    if parsed_new_url.netloc == parsed_url.netloc and parsed_new_url.scheme == parsed_url.scheme:
+                        crawl(full_url, current_depth + 1)
+        except Exception as e:
+            print(f"Error crawling {url}: {e}")
+
+    crawl(url, 0)
+    return results
+
+
 @https_fn.on_request(
     region="europe-west3",
     cors=options.CorsOptions(
@@ -92,11 +120,33 @@ def build_tree(urls):
 def parse_url(req: https_fn.Request) -> https_fn.Response:
     payload = json.loads(req.data)
     # check if payload contains url
-    if 'url' not in payload:
+    if "url" not in payload:
         return https_fn.Response({"status": 'error', "message": "url is not provided!"})
     url = payload['url']
     tree = sitemap_tree_for_homepage(url)
     urls = [page.url for page in tree.all_pages()]
+    tree_json = json.dumps(build_tree(urls))
+    return https_fn.Response(tree_json)
+
+
+@https_fn.on_request(
+    region="europe-west3",
+    cors=options.CorsOptions(
+        cors_origins="*",
+        cors_methods=["post"],
+    ),
+    memory=MemoryOption.GB_1,
+    timeout_sec=540,
+)
+def recursive_parse_url(req: https_fn.Request) -> https_fn.Response:
+    payload = json.loads(req.data)
+    # check if payload contains url
+    if "url" not in payload:
+        return https_fn.Response({"status": "error", "message": "url is not provided!"})
+    url = payload["url"]
+    depth = payload.get("depth", 2)
+    max_pages = payload.get("max_pages", 20)
+    urls = recursive_crawler(url, depth, max_pages)
     tree_json = json.dumps(build_tree(urls))
     return https_fn.Response(tree_json)
 
